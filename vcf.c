@@ -2045,6 +2045,78 @@ static int bcf_enc_long1(kstring_t *s, int64_t x) {
     return e == 0 ? 0 : -1;
 }
 
+int serialize_int_array(kstring_t *s, int n, const int32_t *a, int bt_type)
+{
+    int i;
+    if (bt_type == BCF_BT_INT8) {
+        for (i = 0; i < n; ++i)
+            if ( a[i]==bcf_int32_vector_end ) kputc(bcf_int8_vector_end, s);
+            else if ( a[i]==bcf_int32_missing ) kputc(bcf_int8_missing, s);
+            else kputc(a[i], s);
+    } else if (bt_type == BCF_BT_INT16) {
+        uint8_t *p;
+        ks_resize(s, s->l + n * sizeof(int16_t));
+        p = (uint8_t *) s->s + s->l;
+        for (i = 0; i < n; ++i) {
+            int16_t x;
+            if ( a[i]==bcf_int32_vector_end ) x = bcf_int16_vector_end;
+            else if ( a[i]==bcf_int32_missing ) x = bcf_int16_missing;
+            else x = a[i];
+            i16_to_le(x, p);
+            p += sizeof(int16_t);
+        }
+        s->l += n * sizeof(int16_t);
+    } else {
+        uint8_t *p;
+        ks_resize(s, s->l + n * sizeof(int32_t));
+        p = (uint8_t *) s->s + s->l;
+        for (i = 0; i < n; ++i) {
+            i32_to_le(a[i], p);
+            p += sizeof(int32_t);
+        }
+        s->l += n * sizeof(int32_t);
+    }
+
+    return 0; // FIXME: check for errs in this function
+}
+
+int serialize_offset_array(kstring_t *s, int n, const uint32_t *a, int bt_type)
+{
+    uint32_t last_off = 0;
+    int i;
+    if (bt_type == BCF_BT_INT8) {
+        for (i = 0; i < n; ++i) {
+            uint32_t off = a[i] - last_off;
+            last_off = a[i] + 1;
+            kputc(off, s);
+        }
+    } else if (bt_type == BCF_BT_INT16) {
+        uint8_t *p;
+        ks_resize(s, s->l + n * sizeof(int16_t));
+        p = (uint8_t *) s->s + s->l;
+        for (i = 0; i < n; ++i) {
+            uint16_t off = a[i] - last_off;
+            last_off = a[i] + 1;
+            i16_to_le(off, p);
+            p += sizeof(int16_t);
+        }
+        s->l += n * sizeof(int16_t);
+    } else {
+        uint8_t *p;
+        ks_resize(s, s->l + n * sizeof(int32_t));
+        p = (uint8_t *) s->s + s->l;
+        for (i = 0; i < n; ++i) {
+            uint32_t off = a[i] - last_off;
+            last_off = a[i] + 1;
+            i32_to_le(off, p);
+            p += sizeof(int32_t);
+        }
+        s->l += n * sizeof(int32_t);
+    }
+
+    return 0; // FIXME: check for errs in this function
+}
+
 static inline int serialize_float_array(kstring_t *s, size_t n, const float *a) {
     uint8_t *p;
     size_t i;
@@ -3889,7 +3961,7 @@ int bcf_update_format_string(const bcf_hdr_t *hdr, bcf1_t *line, const char *key
     return ret;
 }
 
-int bcf_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const void *values, int n, int type)
+int _bcf_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const void *values, int n, int type, const uint32_t *offsets, int sparse_n)
 {
     // Is the field already present?
     int i, fmt_id = bcf_hdr_id2int(hdr,BCF_DT_ID,key);
@@ -3928,22 +4000,80 @@ int bcf_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const
     // Encode the values and determine the size required to accommodate the values
     kstring_t str = {0,0,0};
     bcf_enc_int1(&str, fmt_id);
-    if ( type==BCF_HT_INT )
-        bcf_enc_vint(&str, n, (int32_t*)values, nps);
-    else if ( type==BCF_HT_REAL )
+
+    if (offsets)
     {
-        bcf_enc_size(&str, nps, BCF_BT_FLOAT);
-        serialize_float_array(&str, nps*line->n_sample, (float *) values);
-    }
-    else if ( type==BCF_HT_STR )
-    {
-        bcf_enc_size(&str, nps, BCF_BT_CHAR);
-        kputsn((char*)values, nps*line->n_sample, &str);
+        bcf_enc_size(&str, nps, BCF_BT_SPARSE);
+        uint32_t offset_max = 0;
+        uint32_t last_off = 0;
+        for (int i = 0; i < sparse_n; ++i)
+        {
+            uint32_t off = offsets[i] - last_off;
+            last_off = offsets[i] + 1;
+            if (off > offset_max) offset_max = off;
+        }
+
+        int offset_type = bcf_enc_inttype((int32_t)offset_max);
+        int value_type;
+        if (type == BCF_HT_INT)
+        {
+            int value_max = 0;
+            int value_min = 0;
+            int* ivalues = (int*)values;
+            for (int i = 0; i < sparse_n; ++i)
+            {
+                if (ivalues[i] == bcf_int32_missing || ivalues[i] == bcf_int32_vector_end ) continue;
+                if (ivalues[i] > value_max) value_max = ivalues[i];
+                else if (ivalues[i] < value_min) value_min = ivalues[i];
+            }
+            value_type = bcf_enc_inttype(value_max > -value_min ? value_max : value_min);
+        }
+        else if (type == BCF_HT_REAL)
+            value_type = BCF_BT_FLOAT;
+        else if (type == BCF_HT_STR)
+            value_type = BCF_BT_CHAR;
+        else
+        {
+            hts_log_error("The type %d not implemented yet", type);
+            abort();
+        }
+
+        kputc(value_type << 4 | offset_type, &str);
+        bcf_enc_int1(&str, sparse_n);
+
+        if (type == BCF_HT_INT)
+            serialize_int_array(&str, sparse_n, (int32_t*)values, value_type);
+        else if (type == BCF_HT_REAL)
+            serialize_float_array(&str, sparse_n, (float*)values);
+        else if (type == BCF_HT_STR)
+            kputsn((char *) values, sparse_n, &str);
+        else
+        {
+            hts_log_error("The type %d not implemented yet", type);
+            abort();
+        }
+
+        serialize_offset_array(&str, sparse_n, offsets, offset_type);
     }
     else
     {
-        hts_log_error("The type %d not implemented yet", type);
-        abort();
+        if (type == BCF_HT_INT)
+            bcf_enc_vint(&str, n, (int32_t *) values, nps);
+        else if (type == BCF_HT_REAL)
+        {
+            bcf_enc_size(&str, nps, BCF_BT_FLOAT);
+            serialize_float_array(&str, nps * line->n_sample, (float *) values);
+        }
+        else if (type == BCF_HT_STR)
+        {
+            bcf_enc_size(&str, nps, BCF_BT_CHAR);
+            kputsn((char *) values, nps * line->n_sample, &str);
+        }
+        else
+        {
+            hts_log_error("The type %d not implemented yet", type);
+            abort();
+        }
     }
 
     if ( !fmt )
@@ -3992,6 +4122,15 @@ int bcf_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const
     return 0;
 }
 
+int bcf_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const void *values, int n, int type)
+{
+  return _bcf_update_format(hdr, line, key, values, n, type, NULL, 0);
+}
+
+int sav_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const void *values, int dense_n, int type, const uint32_t *offsets, int sparse_n)
+{
+  return _bcf_update_format(hdr, line, key, values, dense_n, type, offsets, sparse_n);
+}
 
 int bcf_update_filter(const bcf_hdr_t *hdr, bcf1_t *line, int *flt_ids, int n)
 {

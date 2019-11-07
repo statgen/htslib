@@ -134,6 +134,7 @@ extern uint8_t bcf_type_shift[];
 #define BCF_BT_INT64    4  // Unofficial, for internal use only.
 #define BCF_BT_FLOAT    5
 #define BCF_BT_CHAR     7
+#define BCF_BT_SPARSE   8
 
 #define VCF_REF      0
 #define VCF_SNP      1
@@ -733,6 +734,7 @@ set to one of BCF_ERR* codes and must be checked before calling bcf_write().
     #define bcf_update_genotypes(hdr,line,gts,n) bcf_update_format((hdr),(line),"GT",(gts),(n),BCF_HT_INT)     // See bcf_gt_ macros below
     int bcf_update_format_string(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const char **values, int n);
     int bcf_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const void *values, int n, int type);
+    int sav_update_format(const bcf_hdr_t *hdr, bcf1_t *line, const char *key, const void *values, int dense_n, int type, const uint32_t *offsets, int sparse_n);
 
     // Macros for setting genotypes correctly, for use with bcf_update_genotypes only; idx corresponds
     // to VCF's GT (1-based index to ALT or 0 for the reference allele) and val is the opposite, obtained
